@@ -137,13 +137,15 @@ def main():
                   "  android.accept_sdk_license = True")
 
         # ---- NDK / API 与 p4a 版本是否匹配 ----
-        ndk_v = api_v = p4a_v = ""
+        ndk_v = api_v = p4a_v = archs_v = ""
         for line in text.splitlines():
             s = line.strip()
             if s.startswith("android.ndk "):
                 ndk_v = s.split("=", 1)[1].strip() if "=" in s else ""
             elif s.startswith("android.api "):
                 api_v = s.split("=", 1)[1].strip() if "=" in s else ""
+            elif s.startswith("android.archs"):
+                archs_v = s.split("=", 1)[1].strip() if "=" in s else ""
             elif s.startswith("p4a.branch"):
                 p4a_v = s.split("=", 1)[1].strip() if "=" in s else ""
 
@@ -170,6 +172,21 @@ def main():
                 check("目标 API", OK, f"android.api = {api_v}（p4a 要求 >= 30）")
         except ValueError:
             check("目标 API", WARN, f"android.api 值无法解析：{api_v!r}")
+
+        # 每多一个 CPU 架构，numpy / pillow 都要用 NDK 重新交叉编译一遍，
+        # 构建时间和磁盘占用接近翻倍。云端构建超时、磁盘写满，
+        # 十有八九是这里多写了一个架构。
+        if archs_v:
+            n_arch = len([a for a in archs_v.split(",") if a.strip()])
+            if n_arch > 1:
+                check("目标架构", WARN,
+                      f"android.archs 配了 {n_arch} 个架构：{archs_v}\n"
+                      "每多一个架构，numpy/pillow 都要重新交叉编译一遍，\n"
+                      "构建时间和磁盘占用接近翻倍。只做功能验证时建议只留 arm64-v8a。")
+            else:
+                check("目标架构", OK, f"android.archs = {archs_v}")
+        else:
+            check("目标架构", WARN, "未设置 android.archs，buildozer 会打全部架构（非常慢）")
     else:
         check("buildozer.spec", FAIL, "文件不存在")
 

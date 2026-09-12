@@ -13,6 +13,16 @@ name: Build Android APK
 #    4. 等 20-40 分钟，在页面底部 Artifacts 下载 apk
 #
 #  首次构建要下载 Android SDK/NDK，比较慢；之后有缓存会快很多。
+#
+#  ------------------------------------------------------------
+#  【排错提醒】如果你只看到这一句：
+#      "No files were found with the provided path: apk-output/*.apk"
+#  那它不是真正的原因，只是"没有产物可上传"的结果。真正的原因
+#  一定在下面这两个地方之一：
+#    a) 失败步骤的 "构建失败诊断" 摘要（Summary 页）
+#    b) Artifacts -> build-log（完整 build.log）
+#  本文件已保证：构建失败时日志一定会打印出来，不会再被吞掉。
+#  ------------------------------------------------------------
 # ============================================================
 
 'on':
@@ -32,8 +42,8 @@ jobs:
     # 到时要迁到 24.04（需同步调整依赖与 p4a 版本）。
     runs-on: ubuntu-22.04
 
-    # 首次构建下 SDK/NDK + 编译 numpy 可能超过 1 小时，给足余量
-    timeout-minutes: 90
+    # 首次构建要下 SDK/NDK + 交叉编译 numpy，给足余量
+    timeout-minutes: 120
 
     # 强制 UTF-8，避免非 ASCII 的 app 名称在 C locale 下写文件报错
     env:
@@ -44,6 +54,25 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        # why：GitHub 的 22.04 runner 预装了 Android SDK、.NET、GHC 等
+        # 十来个 G 我们用不到的东西。而 p4a 要自己下载整套 SDK + NDK
+        # （解压后 ~8G），再交叉编译 numpy/pillow，磁盘很容易爆，
+        # 爆了之后的报错五花八门（No space left on device），很难查。
+        # 这里先把预装的清掉，腾出空间。
+        run: |
+          echo "==== 清理前 ===="
+          df -h /
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/local/share/chromium || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          echo "==== 清理后 ===="
+          df -h /
 
       - name: 安装系统依赖
         run: |
@@ -85,9 +114,14 @@ jobs:
           path: |
             ~/.buildozer
             poker_gto_android/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('poker_gto_android/buildozer.spec') }}
-          restore-keys: |
-            buildozer-${{ runner.os }}-
+          # 用固定的版本号做 key，不要拼 buildozer.spec 的哈希——
+          # 否则每次改一下 spec 都会让 ~5G 的 SDK/NDK 全部重下。
+          # 真要换 NDK / p4a 版本时，把下面的 v4 手动 +1 即可
+          # （换 key 同时也是一次"丢掉可能已损坏的中间产物"的机会）。
+          key: buildozer-${{ runner.os }}-v4
+          # 故意不写 restore-keys：旧 key 是一串 spec 哈希，如果是那批
+          # 缓存坏了、导致构建中途"静默跳过"，前缀匹配会让它又回来。
+          # 这里只认精确的 v4，宁可第一次慢一点，也要拿到干净环境。
 
       - name: 检查中文字体
         working-directory: poker_gto_android
@@ -154,12 +188,60 @@ jobs:
           fi
           exit "$STATUS"
 
+      - name: 校验产物
+        # 这一步专门堵一个很难查的坑：buildozer 有时候会以退出码 0 结束，
+        # 但 bin/ 下压根没有 apk（例如中间产物脏了、或它在某个子步骤里
+        # 打印了错误却没有把错误码传出来）。这时如果直接去上传，你只会
+        # 看到 "No files were found ... apk-output/*.apk" 这种毫无信息量
+        # 的报错。所以这里先自己检查，没有就直接把日志甩出来。
+        working-directory: poker_gto_android
+        run: |
+          echo "==== 磁盘剩余（排查 No space left on device）===="
+          df -h / || true
+          echo ""
+          echo "==== bin/ 目录内容 ===="
+          ls -lh bin/ 2>/dev/null || echo "(bin/ 目录不存在)"
+
+          APK=$(ls bin/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            {
+              echo '## 构建正常结束，但没有产出 apk'
+              echo ""
+              echo "buildozer 退出码为 0，但 \`bin/*.apk\` 不存在。"
+              echo "下面是从 build.log 里摘出来的可疑行。"
+              echo ""
+              echo "### 可疑行"
+              echo '```text'
+              grep -n -i -E "error|failed|exception|no space|not found|licence|license|unable" \
+                build.log 2>/dev/null | tail -n 60 || echo "(build.log 里没匹配到)"
+              echo '```'
+              echo ""
+              echo "### build.log 尾部 120 行"
+              echo '```text'
+              tail -n 120 build.log 2>/dev/null || echo "(build.log 不存在)"
+              echo '```'
+              echo ""
+              echo "> 完整日志见 Artifacts → build-log"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "::error::buildozer 正常退出，但 bin/ 下没有 apk。原因见本步骤日志与 Summary 页。"
+            echo "==== 全仓库搜一遍 apk（排除 SDK 自带的）===="
+            find .. -name "*.apk" -not -path "*/android-sdk/*" 2>/dev/null | head -20 || true
+            echo "==== build.log 尾部 200 行 ===="
+            tail -n 200 build.log 2>/dev/null || echo "(build.log 不存在)"
+            exit 1
+          fi
+
+          echo "找到产物：$APK"
+          ls -lh "$APK"
+          echo "产物校验通过"
+
       - name: 构建失败时输出诊断摘要
         if: failure()
         working-directory: poker_gto_android
         run: |
           # grep 没匹配到时会返回 1，先把结果落到文件，避免干扰判断
-          grep -n -i -E "error|failed|exception|not found|licence|license|unable" \
+          grep -n -i -E "error|failed|exception|not found|no space|licence|license|unable" \
             build.log > /tmp/errs.txt 2>/dev/null || true
           {
             echo "## 构建失败诊断"
@@ -182,20 +264,19 @@ jobs:
         working-directory: poker_gto_android
         run: |
           mkdir -p ../apk-output
-          if ls bin/*.apk >/dev/null 2>&1; then
-            cp bin/*.apk ../apk-output/
-            echo "已收集 apk："
-            ls -lh ../apk-output/
-          else
-            echo "::warning::bin/ 下没有 apk，构建没有产出成品"
-          fi
+          # 用 find 而不是写死 bin/*.apk：万一 buildozer 把产物放到了
+          # 别的地方（换 p4a 版本后输出目录可能变），也不会漏掉。
+          find . -maxdepth 2 -name "*.apk" -exec cp -v {} ../apk-output/ \;
+          echo "==== 待上传的产物 ===="
+          ls -lh ../apk-output/
 
       - name: 上传 APK
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: gto-helper-apk
           path: apk-output/*.apk
+          # 走到这里说明「校验产物」已经通过了，理论上有文件。
+          # 真没有就报错，别静默给个空 artifact。
           if-no-files-found: error
           retention-days: 30
 
