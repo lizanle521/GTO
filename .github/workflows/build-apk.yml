@@ -25,7 +25,21 @@ name: Build Android APK
 
 jobs:
   build:
+    # 用 22.04 而不是 ubuntu-latest：p4a v2024.01.21 是在这一代系统上
+    # 验证的（Python 3.10、libtinfo5 还在）。24.04 移除了 libtinfo5，
+    # 且默认 Python 3.12 已删掉 distutils，p4a 会踩坑。
+    # 注意：22.04 镜像从 2026-09-17 起进入弃用期，2027-04-17 彻底下线，
+    # 到时要迁到 24.04（需同步调整依赖与 p4a 版本）。
     runs-on: ubuntu-22.04
+
+    # 首次构建下 SDK/NDK + 编译 numpy 可能超过 1 小时，给足余量
+    timeout-minutes: 90
+
+    # 强制 UTF-8，避免非 ASCII 的 app 名称在 C locale 下写文件报错
+    env:
+      PYTHONUTF8: "1"
+      LANG: "C.UTF-8"
+      LC_ALL: "C.UTF-8"
 
     steps:
       - name: 检出代码
@@ -35,18 +49,35 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git zip unzip openjdk-17-jdk \
-            autoconf libtool pkg-config \
-            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
+            git zip unzip \
+            autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev \
             cmake libffi-dev libssl-dev \
             python3-pip python3-setuptools
+          # libtinfo5 在 22.04 有、24.04 没有，装不上不算错
+          sudo apt-get install -y libtinfo5 \
+            || echo "libtinfo5 不可用（Ubuntu 24.04+ 属正常），跳过"
 
-      - name: 确认 Java 版本
-        run: java -version
+      - name: 安装 Java 17（Gradle 需要）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: 安装 Buildozer 与 Cython
         run: |
-          pip3 install --user --upgrade buildozer cython==0.29.36
+          python -m pip install --upgrade pip wheel setuptools
+          # Cython 必须锁在 0.29.x：p4a v2024.01.21 不支持 Cython 3
+          python -m pip install buildozer "cython==0.29.36"
+          echo "---- 版本确认 ----"
+          buildozer --version
+          cython --version
+          java -version
 
       - name: 缓存 Buildozer 的 SDK/NDK
         uses: actions/cache@v4
@@ -61,38 +92,119 @@ jobs:
       - name: 检查中文字体
         working-directory: poker_gto_android
         run: |
+          # 用 od（coreutils 自带）取文件头十六进制，不用 xxd——
+          # xxd 属于 vim-common，不保证每个 runner 都有。
+          magic_of() { head -c 4 "$1" | od -An -tx1 | tr -d ' \n'; }
+
           # 正常情况下 assets/chinese.ttf（Noto Sans SC，开源可商用）
           # 已随代码提交。若缺失则临时下载一个。
-          if [ ! -f assets/chinese.ttf ]; then
-            echo "assets/chinese.ttf 缺失，下载 Noto Sans SC..."
+          FONT_OK=0
+          if [ -f assets/chinese.ttf ]; then
+            SIZE=$(stat -c%s assets/chinese.ttf)
+            MAGIC=$(magic_of assets/chinese.ttf)
+            echo "已存在字体：${SIZE} 字节，魔术字节 ${MAGIC}"
+            # 合法开头：00010000(TrueType) 4f54544f(OTTO) 74727565(true) 74746366(ttcf)
+            case "$MAGIC" in
+              00010000|4f54544f|74727565|74746366) FONT_OK=1 ;;
+              *) echo "字体魔术字节不合法，疑似损坏，将重新下载" ;;
+            esac
+          fi
+
+          if [ "$FONT_OK" != "1" ]; then
+            echo "下载 Noto Sans SC..."
             mkdir -p assets
             curl -L --retry 3 -o assets/chinese.ttf \
               "https://github.com/notofonts/noto-cjk/raw/main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf"
+            MAGIC=$(magic_of assets/chinese.ttf)
+            echo "下载后魔术字节：${MAGIC}"
+            case "$MAGIC" in
+              00010000|4f54544f|74727565|74746366) ;;
+              *) echo "::error::字体下载后仍不是合法字体，界面中文会显示成方块"; exit 1 ;;
+            esac
           fi
           ls -lh assets/chinese.ttf
           echo "字体已就绪"
 
       - name: 打包前体检
         working-directory: poker_gto_android
-        run: python3 preflight.py || true
+        # 体检里有一项是「Windows 不能打包」，在 Linux 上应为通过；
+        # 这里不阻断构建，只打日志。
+        run: python preflight.py || true
 
       - name: 打包 APK
         working-directory: poker_gto_android
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          buildozer -v android debug 2>&1 | tail -n 200
+          # 两个要点：
+          # 1) 用 yes 自动回答可能出现的交互式提问（SDK 许可证等）。
+          #    buildozer.spec 里已设 android.accept_sdk_license = True，
+          #    这里是双保险。
+          # 2) 绝对不要写成 `buildozer ... | tail -n 200`——管道会让
+          #    退出码变成 tail 的，构建失败时这一步仍然显示成绿色，
+          #    错误被吞掉。用 PIPESTATUS 精确取 buildozer 自己的状态。
+          set +e
+          yes | buildozer -v android debug 2>&1 | tee build.log
+          # PIPESTATUS[0]=yes  [1]=buildozer  [2]=tee
+          STATUS=${PIPESTATUS[1]}
+          echo "===================================="
+          echo "buildozer 退出码: $STATUS"
+          echo "===================================="
+          if [ "$STATUS" -ne 0 ]; then
+            echo "==== 构建失败，日志最后 150 行 ===="
+            tail -n 150 build.log
+          fi
+          exit "$STATUS"
+
+      - name: 构建失败时输出诊断摘要
+        if: failure()
+        working-directory: poker_gto_android
+        run: |
+          # grep 没匹配到时会返回 1，先把结果落到文件，避免干扰判断
+          grep -n -i -E "error|failed|exception|not found|licence|license|unable" \
+            build.log > /tmp/errs.txt 2>/dev/null || true
+          {
+            echo "## 构建失败诊断"
+            echo ""
+            echo "### 匹配到的关键错误行（最多 60 行）"
+            echo '```text'
+            tail -n 60 /tmp/errs.txt || true
+            echo '```'
+            echo ""
+            echo "### 完整日志尾部 80 行"
+            echo '```text'
+            tail -n 80 build.log || true
+            echo '```'
+            echo ""
+            echo "> 完整日志见本次运行的 Artifacts → build-log"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "诊断摘要已写入本次运行的 Summary 页"
 
       - name: 收集产物
         working-directory: poker_gto_android
         run: |
           mkdir -p ../apk-output
-          cp bin/*.apk ../apk-output/ || echo "未找到 apk，检查上面的构建日志"
-          ls -lh ../apk-output/ || true
+          if ls bin/*.apk >/dev/null 2>&1; then
+            cp bin/*.apk ../apk-output/
+            echo "已收集 apk："
+            ls -lh ../apk-output/
+          else
+            echo "::warning::bin/ 下没有 apk，构建没有产出成品"
+          fi
 
       - name: 上传 APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: gto-helper-apk
           path: apk-output/*.apk
           if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传完整构建日志（无论成败）
+        # 关键：失败时也能把完整日志下载下来，不用靠截屏猜
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: poker_gto_android/build.log
+          if-no-files-found: ignore
           retention-days: 30

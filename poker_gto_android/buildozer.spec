@@ -23,7 +23,7 @@ source.include_exts = py,png,jpg,jpeg,kv,atlas,ttf,otf,json,txt
 
 # 只打包运行必需的文件，测试与文档不进包
 source.exclude_dirs = tests,bin,.buildozer,__pycache__,.git,.github,assets/raw
-source.exclude_patterns = test_*.py,*.md,*.bat,_probe.py,pack_font.py
+source.exclude_patterns = test_*.py,*.md,*.bat,*.sh,pack_font.py,preflight.py,build.log
 
 version = 0.1.0
 
@@ -53,6 +53,17 @@ android.api = 33
 android.minapi = 24
 android.ndk = 25b
 android.archs = arm64-v8a, armeabi-v7a
+
+# ------------------------------------------------------------
+# 关键：自动接受 Android SDK 许可证
+# ------------------------------------------------------------
+# 这一行必须保留。buildozer 这个选项的默认值是 False，此时它会以交互方式
+# 询问是否接受 SDK 许可证；在 CI（GitHub Actions）里没有终端可以输入，
+# 于是 SDK 组件装不上，构建直接失败，报错通常是：
+#   "Failed to install the following Android SDK packages as some licences
+#    have not been accepted"
+# 本地手动打包时可以删掉（那样会弹出提示让你确认），但在云端必须为 True。
+android.accept_sdk_license = True
 
 android.allow_backup = True
 android.wakelock = True

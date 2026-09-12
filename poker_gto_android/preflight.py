@@ -112,6 +112,64 @@ def main():
             check("权限配置", OK, perms.strip())
         else:
             check("权限配置", FAIL, "缺少 CAMERA 权限，摄像头无法工作")
+
+        # ---- SDK 许可证：云端构建最常见的失败原因 ----
+        # buildozer 源码里是
+        #   config.getboolean('app', 'android.accept_sdk_license', fallback=False)
+        # 默认 False，会以交互方式询问是否接受许可证。CI 上没有终端可输入，
+        # SDK 组件装不上，构建在下载 SDK 那一步就挂了。
+        license_val = ""
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("android.accept_sdk_license"):
+                license_val = s.split("=", 1)[1].strip() if "=" in s else ""
+        if license_val.lower() == "true":
+            check("SDK 许可证", OK, "android.accept_sdk_license = True（云端可自动接受）")
+        else:
+            check("SDK 许可证", FAIL,
+                  "未设置 android.accept_sdk_license = True。\n"
+                  "该选项在 buildozer 里默认是 False，会交互式询问是否接受 SDK\n"
+                  "许可证；GitHub Actions 等无终端环境下装不上 SDK，构建必然失败，\n"
+                  "典型报错：\n"
+                  "  Failed to install the following Android SDK packages as some\n"
+                  "  licences have not been accepted\n"
+                  "解决：在 buildozer.spec 的 [app] 段加一行\n"
+                  "  android.accept_sdk_license = True")
+
+        # ---- NDK / API 与 p4a 版本是否匹配 ----
+        ndk_v = api_v = p4a_v = ""
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("android.ndk "):
+                ndk_v = s.split("=", 1)[1].strip() if "=" in s else ""
+            elif s.startswith("android.api "):
+                api_v = s.split("=", 1)[1].strip() if "=" in s else ""
+            elif s.startswith("p4a.branch"):
+                p4a_v = s.split("=", 1)[1].strip() if "=" in s else ""
+
+        # p4a 各版本对 NDK 的支持区间很窄（v2024.01.21 只支持 NDK 25）
+        p4a_ndk = {"v2024.01.21": "25b"}
+        if ndk_v and p4a_v in p4a_ndk:
+            if ndk_v != p4a_ndk[p4a_v]:
+                check("NDK 版本", FAIL,
+                      f"p4a {p4a_v} 只支持 NDK {p4a_ndk[p4a_v]}，当前写的是 {ndk_v}。\n"
+                      "NDK 版本不匹配会在编译 C 扩展时报链接错误。")
+            else:
+                check("NDK 版本", OK, f"p4a {p4a_v} + NDK {ndk_v}（匹配）")
+        elif ndk_v:
+            check("NDK 版本", OK, f"NDK {ndk_v}（p4a {p4a_v or '默认'}，未做匹配校验）")
+        else:
+            check("NDK 版本", WARN, "未固定 android.ndk，由 buildozer 按 p4a 推荐值自动选")
+
+        # p4a v2024.01.21 的 MIN_TARGET_API 是 30，低于它会直接报错
+        try:
+            if api_v and int(api_v) < 30:
+                check("目标 API", FAIL,
+                      f"android.api = {api_v}，低于 p4a v2024.01.21 要求的最低值 30")
+            elif api_v:
+                check("目标 API", OK, f"android.api = {api_v}（p4a 要求 >= 30）")
+        except ValueError:
+            check("目标 API", WARN, f"android.api 值无法解析：{api_v!r}")
     else:
         check("buildozer.spec", FAIL, "文件不存在")
 
