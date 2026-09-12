@@ -1,0 +1,98 @@
+name: Build Android APK
+
+# ============================================================
+#  GTO 助手 - GitHub Actions 云端打包
+#
+#  为什么用云端：Buildozer 只能在 Linux 上跑，Windows 不支持。
+#  推送到 GitHub 后由云端的 Linux 机器帮你打包，全程免费。
+#
+#  用法：
+#    1. 把整个 poker_gto_android 目录推到 GitHub 仓库
+#    2. 打开仓库的 Actions 页，选 "Build Android APK"
+#    3. 点 "Run workflow" 手动触发（或直接 push 自动触发）
+#    4. 等 20-40 分钟，在页面底部 Artifacts 下载 apk
+#
+#  首次构建要下载 Android SDK/NDK，比较慢；之后有缓存会快很多。
+# ============================================================
+
+'on':
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'poker_gto_android/**'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:        # 允许手动点按钮触发
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip openjdk-17-jdk \
+            autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
+            cmake libffi-dev libssl-dev \
+            python3-pip python3-setuptools
+
+      - name: 确认 Java 版本
+        run: java -version
+
+      - name: 安装 Buildozer 与 Cython
+        run: |
+          pip3 install --user --upgrade buildozer cython==0.29.36
+
+      - name: 缓存 Buildozer 的 SDK/NDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            poker_gto_android/.buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('poker_gto_android/buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      - name: 检查中文字体
+        working-directory: poker_gto_android
+        run: |
+          # 正常情况下 assets/chinese.ttf（Noto Sans SC，开源可商用）
+          # 已随代码提交。若缺失则临时下载一个。
+          if [ ! -f assets/chinese.ttf ]; then
+            echo "assets/chinese.ttf 缺失，下载 Noto Sans SC..."
+            mkdir -p assets
+            curl -L --retry 3 -o assets/chinese.ttf \
+              "https://github.com/notofonts/noto-cjk/raw/main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf"
+          fi
+          ls -lh assets/chinese.ttf
+          echo "字体已就绪"
+
+      - name: 打包前体检
+        working-directory: poker_gto_android
+        run: python3 preflight.py || true
+
+      - name: 打包 APK
+        working-directory: poker_gto_android
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          buildozer -v android debug 2>&1 | tail -n 200
+
+      - name: 收集产物
+        working-directory: poker_gto_android
+        run: |
+          mkdir -p ../apk-output
+          cp bin/*.apk ../apk-output/ || echo "未找到 apk，检查上面的构建日志"
+          ls -lh ../apk-output/ || true
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gto-helper-apk
+          path: apk-output/*.apk
+          if-no-files-found: error
+          retention-days: 30
