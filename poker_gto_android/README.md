@@ -291,11 +291,28 @@ python pack_font.py --system   # 用系统字体（仅本机调试，勿发布�
 - [x] 筹码深度自适应范围宽度
 - [x] 识别契约扩展（12 字段）+ 解析层校验与降级
 - [x] 牌力计算金标准验证（穷举对照精确值）
+- [x] **云端打包跑通，产出 `gtohelper-0.1.0-arm64-v8a-debug.apk`（36 MB，run 34742407158）**
 
 待办：
 
-- [ ] 推到 GitHub，跑通第一次云端打包，拿到 apk
 - [ ] 加 App 图标和启动图
 - [ ] 在真机上测试摄像头、识别准确率、界面适配
 - [ ] 根据真机反馈调抽帧间隔和变化阈值
 - [ ] 用真实牌桌截图回归识别契约（目前只验证了"字段能被解析"，没验证"AI 能读准"）
+- [ ] 如需支持老机型（armeabi-v7a），改回 `android.archs` 但构建时间会显著变长
+
+### 产物验收记录（2026-09-13，run 34742407158）
+
+apk 已解包核对，确认修复真实生效在产物里，不只是"构建变绿"：
+
+| 检查项 | 结果 |
+|---|---|
+| `screenOrientation` | `int=1` = `SCREEN_ORIENTATION_PORTRAIT` ✅（修复前是 0=landscape） |
+| `--orientation` 构建参数 | `portrait` ✅ |
+| `--feature` 参数 | **已消失** ✅（此前是报错根因） |
+| 权限 | `CAMERA` / `INTERNET` / `WAKE_LOCK` ✅ |
+| `android.hardware.camera` | 不在 Manifest ✅（不该声明为必需特性） |
+| 12 个业务模块 | `main/decision/poker_core/ranges/recognizer/realtime/trainer/stats/config` + `sitecustomize` 全部 `.pyc` 已打入 ✅ |
+| 中文字体 | `assets/chinese.ttf` 10.5 MB ✅ |
+| 排除清单 | `verify_core / preflight / test_* / pack_font` 均未打入 ✅ |
+| apk 完整性 | 32 条目，`testzip` 无损坏 |
