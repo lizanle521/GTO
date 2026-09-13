@@ -126,7 +126,9 @@ def run_all(app, m):
         "hero_position": "BTN", "confidence": "high",
     })
     assert "顺子" in rs.lbl_rec.text, f"未识别顺子: {rs.lbl_rec.text}"
-    assert "大注" in rs.lbl_detail.text, f"成牌未建议大注: {rs.lbl_detail.text}"
+    # 界面布局：动作结论放标题栏，依据（牌型/胜率/尺度）放详情里，
+    # 所以"是否建议大注"要看标题。
+    assert "大注" in rs.lbl_rec.text, f"成牌未建议大注: {rs.lbl_rec.text}"
     log("  ✓ 成牌顺子正确建议下大注")
 
     # 未成顺但两头顺听牌 → 不应被判成成牌，且应给出听牌建议
@@ -135,11 +137,12 @@ def run_all(app, m):
         "hole_cards": ["9h", "8h"], "board_cards": ["Ts", "7d", "2c"],
         "hero_position": "BTN", "confidence": "high",
     })
-    assert "高牌" in rs.lbl_rec.text, f"四张顺不该判成成牌: {rs.lbl_rec.text}"
+    assert "高牌" in rs.lbl_detail.text, \
+        f"四张顺不该判成成牌: {rs.lbl_rec.text} / {rs.lbl_detail.text}"
     assert "两头顺听牌" in rs.lbl_detail.text, \
         f"未识别两头顺听牌: {rs.lbl_detail.text}"
-    assert "半诈唬" in rs.lbl_detail.text, \
-        f"强听牌未建议半诈唬: {rs.lbl_detail.text}"
+    assert "半诈唬" in rs.lbl_rec.text, \
+        f"强听牌未建议半诈唬: {rs.lbl_rec.text}"
     log("  ✓ 未成顺时正确识别两头顺听牌")
 
     # 纯空气牌 → 应建议过牌

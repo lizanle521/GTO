@@ -7,16 +7,10 @@
 import os
 import sys
 
-os.environ["KIVY_NO_ARGS"] = "1"
-os.environ["KIVY_LOG_LEVEL"] = "error"
-
-from kivy.config import Config
-Config.set("graphics", "width", "100")
-Config.set("graphics", "height", "100")
-Config.set("graphics", "window_state", "hidden")
-
 from poker_core import evaluate_best, categorize, describe_score
-from main import analyze_draws, postflop_advice, is_overpair
+# 决策逻辑已从 main.py 抽到 decision.py（纯逻辑、不依赖 Kivy），
+# 所以这里直接导入它 —— 测试不再需要图形环境，跑得更快也更稳。
+from decision import analyze_draws, postflop_advice, is_overpair
 
 FAILED = []
 

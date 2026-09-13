@@ -203,6 +203,198 @@ def categorize(score):
     return category
 
 
+# ---------------------------------------------------------------- 胜率估算
+def estimate_equity(hole, board, num_opponents=1, iterations=600, seed=None):
+    """用蒙特卡洛模拟估算当前牌力的胜率。
+
+    参数:
+        hole: 自己的 2 张手牌，如 ["As", "Kh"]
+        board: 公共牌，0-5 张
+        num_opponents: 假设的对手数量
+        iterations: 模拟次数。越大越准也越慢
+        seed: 固定随机种子，用于测试时复现结果
+
+    返回:
+        (胜率, 平局率)，均为 0.0-1.0；胜率不含平局。
+
+    关于「对手随机」这件事必须说清楚：这里的对手拿到的是**任意两张牌**，
+    不是 GTO 意义上的对手范围。所以这个数字的含义是「对随机范围的胜率」,
+    它是一个乐观的参考值（真实对手的范围通常比随机更强），
+    不能直接当成 GTO 权益来用。界面文案里要标明这一点。
+
+    性能：每次迭代要评估 (1 + num_opponents) 手 7 选 5 的牌。
+    600 次在手机上约 0.3-0.8 秒，足够放进后台线程。
+    """
+    import random
+
+    hole = list(hole)
+    board = list(board)
+    known = hole + board
+
+    for c in known:
+        parse_card(c)                      # 格式不对立刻报错，别拖进模拟循环
+    if len(hole) != 2:
+        raise CardError(f"手牌应为 2 张，收到 {len(hole)} 张")
+    if len(board) > 5:
+        raise CardError(f"公共牌最多 5 张，收到 {len(board)} 张")
+    if len(set(known)) != len(known):
+        raise CardError(f"手牌与公共牌存在重复：{known}")
+    if num_opponents < 1:
+        raise ValueError("对手数量至少为 1")
+    if iterations < 1:
+        raise ValueError("模拟次数至少为 1")
+
+    deck = [c for c in make_deck() if c not in known]
+    need_board = 5 - len(board)
+    draw = need_board + 2 * num_opponents
+    if draw > len(deck):
+        raise ValueError(f"剩余 {len(deck)} 张牌不足以模拟 {num_opponents} 个对手")
+
+    rng = random.Random(seed)
+    wins = ties = 0
+
+    for _ in range(iterations):
+        pick = rng.sample(deck, draw)
+        extra_board = pick[:need_board]
+        opp_pool = pick[need_board:]
+        full_board = board + extra_board
+
+        my_score, _ = evaluate_best(hole + full_board)
+
+        # 只要不输给任何一个对手，就算赢或平
+        best_opp = -1
+        for i in range(num_opponents):
+            opp = opp_pool[2 * i: 2 * i + 2]
+            score, _ = evaluate_best(opp + full_board)
+            if score > best_opp:
+                best_opp = score
+
+        if my_score > best_opp:
+            wins += 1
+        elif my_score == best_opp:
+            ties += 1
+
+    return wins / iterations, ties / iterations
+
+
+def pot_odds(bet_to_call, pot_before_bet):
+    """计算底池赔率：需要的最低胜率才能让跟注不亏。
+
+    bet_to_call: 需要跟注的金额
+    pot_before_bet: 对手下注**之前**的底池（不含他的下注）
+
+    对手下注后底池变成 pot_before_bet + bet_to_call，你跟注后底池变成
+    pot_before_bet + 2 * bet_to_call。因此：
+        需要的胜率 = 跟注额 / (底池 + 跟注额)
+                   = bet / (pot_before + 2 * bet)
+    """
+    if bet_to_call <= 0:
+        return 0.0
+    if pot_before_bet < 0:
+        raise ValueError("底池不能为负")
+    return bet_to_call / (pot_before_bet + 2.0 * bet_to_call)
+
+
+def equity_against_range(hole, board, opponent_range, num_opponents=1,
+                         iterations=600, seed=None):
+    """估算对**指定范围**的胜率（比 estimate_equity 的随机范围更贴近实战）。
+
+    opponent_range: {起手牌记号: 权重}，如 {"AA": 1.0, "AKs": 0.8}。
+                    直接用 ranges.expand_range() 的结果即可。
+    权重只影响抽样概率，不影响最终计算方式。
+    """
+    import random
+
+    if not opponent_range:
+        return estimate_equity(hole, board, num_opponents, iterations, seed)
+
+    board = list(board)
+    hole = list(hole)
+    known = set(hole + board)
+
+    # 预先把范围展开成具体两张牌的组合（剔除与已知牌冲突的）
+    combos = []
+    weights = []
+    for notation, weight in opponent_range.items():
+        for combo in _notation_combos(notation):
+            if any(c in known for c in combo):
+                continue
+            combos.append(combo)
+            weights.append(weight)
+    if not combos:
+        return estimate_equity(hole, board, num_opponents, iterations, seed)
+
+    rng = random.Random(seed)
+    deck = [c for c in make_deck() if c not in known]
+    need_board = 5 - len(board)
+    wins = ties = done = 0
+
+    for _ in range(iterations):
+        # 每个对手重新按权重抽一手牌；抽到与已知牌冲突的就整次作废
+        used = set(known)
+        opps = []
+        ok = True
+        for _ in range(num_opponents):
+            combo = rng.choices(combos, weights=weights, k=1)[0]
+            if any(c in used for c in combo):
+                ok = False
+                break
+            used.update(combo)
+            opps.append(combo)
+        if not ok:
+            continue
+
+        pool = [c for c in deck if c not in used]
+        if len(pool) < need_board:
+            continue
+        full_board = board + rng.sample(pool, need_board)
+
+        my_score, _ = evaluate_best(hole + full_board)
+        best_opp = max(evaluate_best(o + full_board)[0] for o in opps)
+
+        done += 1
+        if my_score > best_opp:
+            wins += 1
+        elif my_score == best_opp:
+            ties += 1
+
+    # 分母用**实际完成的模拟次数**，不是 iterations。
+    # 抽到冲突组合的那些轮次被 continue 跳过了，它们既不算赢也不算输；
+    # 若拿 iterations 当分母，胜率会被系统性地压低（对手范围越窄越明显）。
+    if done == 0:
+        return 0.0, 0.0
+    return wins / done, ties / done
+
+
+def _notation_combos(notation):
+    """把一个起手牌记号展开为具体两张牌的组合列表。
+
+    AA -> 6 种；AKs -> 4 种；AKo -> 12 种。
+    """
+    notation = notation.strip()
+    if not notation:
+        return []
+
+    suit_pairs = [(s1, s2) for s1 in SUITS for s2 in SUITS]
+
+    if len(notation) == 2:                       # 对子
+        r = notation[0].upper()
+        return [[f"{r}{a}", f"{r}{b}"] for i, a in enumerate(SUITS)
+                for b in SUITS[i + 1:]]
+
+    r1, r2 = notation[0].upper(), notation[1].upper()
+    suited = notation[-1].lower() == "s"
+    out = []
+    for a, b in suit_pairs:
+        if a == b and not suited:
+            continue
+        if a != b and suited:
+            continue
+        out.append([f"{r1}{a}", f"{r2}{b}"])
+    return out
+
+
+
 # ---------------------------------------------------------------- 起手牌记号
 def hand_notation(card1, card2):
     """把两张具体牌转换为 169 起手牌记号，如 'AKs' / 'QQ' / 'T9o'。
@@ -346,5 +538,83 @@ if __name__ == "__main__":
         if not better:
             ok = False
         print(f"{status} {desc}（实得 {a}={idx[a]}, {b}={idx[b]}）")
+
+    # ---------------------------------------------------------- 胜率估算
+    import time as _time
+
+    print("\n=== 胜率估算自检（对照理论值）===")
+    t0 = _time.time()
+    eq_aa, tie_aa = estimate_equity(["As", "Ah"], [], num_opponents=1,
+                                    iterations=600, seed=42)
+    dt = _time.time() - t0
+    print(f"AA 翻前 vs 1 个随机对手：胜率 {eq_aa:.1%} 平局 {tie_aa:.1%}"
+          f"（理论约 85%，600 次耗时 {dt * 1000:.0f} ms）")
+    ok = ok and 0.80 <= eq_aa <= 0.90
+
+    eq_aa3, _ = estimate_equity(["As", "Ah"], [], num_opponents=3,
+                                iterations=400, seed=42)
+    print(f"AA 翻前 vs 3 个随机对手：胜率 {eq_aa3:.1%}（理论约 64%）")
+    ok = ok and 0.55 <= eq_aa3 <= 0.72
+
+    eq_72, _ = estimate_equity(["7c", "2d"], [], num_opponents=1,
+                               iterations=600, seed=42)
+    print(f"72o 翻前 vs 1 个随机对手：胜率 {eq_72:.1%}（实测约 32%）")
+    # 注意别拿常被引用的 "72o ≈ 34.6%" 来对：那个数是**含平局折半**的
+    # equity（胜率 + 平局率/2），而本函数返回的是纯胜率，平局单独统计。
+    # 两者差的那 2 个多点，正是平局率的一半。
+    ok = ok and 0.28 <= eq_72 <= 0.36
+
+    # 坚果牌：对手不可能赢，只能是 100%
+    eq_nuts, _ = estimate_equity(["As", "Ah"], ["Ad", "Ac", "2s"],
+                                 num_opponents=1, iterations=300, seed=42)
+    print(f"四条 A 在 A-A-2 牌面：胜率 {eq_nuts:.1%}（应为 100%）")
+    ok = ok and eq_nuts >= 0.999
+
+    # 平局必须单独统计，不能算进胜率——这是最容易写错的地方
+    eq_royal, tie_royal = estimate_equity(
+        ["2c", "3d"], ["As", "Ks", "Qs", "Js", "Ts"],
+        num_opponents=1, iterations=200, seed=42)
+    print(f"公共牌即皇家同花顺：胜率 {eq_royal:.1%} 平局 {tie_royal:.1%}"
+          f"（应全部平局）")
+    ok = ok and tie_royal >= 0.999 and eq_royal <= 0.001
+
+    # 参数校验
+    for bad_call, label in [
+        (lambda: estimate_equity(["As"], [], iterations=10), "手牌只有 1 张"),
+        (lambda: estimate_equity(["As", "As"], [], iterations=10), "重复的牌"),
+        (lambda: estimate_equity(["As", "Ah"], [], num_opponents=0,
+                                 iterations=10), "对手数为 0"),
+    ]:
+        try:
+            bad_call()
+            print(f"✗ {label} 应报错")
+            ok = False
+        except (CardError, ValueError):
+            pass
+    print("  ✓ 非法参数正确报错（1 张手牌 / 重复牌 / 0 个对手）")
+
+    print("\n=== 底池赔率自检 ===")
+    odds_a = pot_odds(50, 100)
+    print(f"底池 100、对手下注 50 -> 需要 {odds_a:.1%} 胜率才不亏（应为 25%）")
+    ok = ok and abs(odds_a - 0.25) < 1e-9
+
+    odds_b = pot_odds(100, 100)
+    print(f"底池 100、对手下注 100 -> 需要 {odds_b:.1%}（应为 33.3%）")
+    ok = ok and abs(odds_b - 1 / 3) < 1e-9
+
+    print(f"无人下注 -> {pot_odds(0, 100):.1%}（应为 0%）")
+    ok = ok and pot_odds(0, 100) == 0.0
+
+    print("\n=== 对指定范围的胜率自检 ===")
+    eq_kk, _ = equity_against_range(["Ks", "Kh"], [], {"AA": 1.0},
+                                    num_opponents=1, iterations=400, seed=7)
+    print(f"KK 翻前对「只有 AA」的范围：胜率 {eq_kk:.1%}（理论约 18%）")
+    ok = ok and 0.10 <= eq_kk <= 0.26
+
+    eq_wide, _ = equity_against_range(
+        ["Ks", "Kh"], [], {"AA": 1.0, "QQ": 1.0, "AKs": 0.5},
+        num_opponents=1, iterations=400, seed=7)
+    print(f"KK 对「AA+QQ+部分 AKs」：胜率 {eq_wide:.1%}（应明显高于只对 AA）")
+    ok = ok and eq_wide > eq_kk
 
     print("\n全部自检通过 ✓" if ok else "\n存在失败项 ✗")

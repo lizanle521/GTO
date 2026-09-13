@@ -39,6 +39,7 @@ def main():
     required = [
         "main.py", "poker_core.py", "ranges.py", "trainer.py",
         "stats.py", "recognizer.py", "realtime.py", "config.py",
+        "decision.py",
         "buildozer.spec",
     ]
     missing = [f for f in required if not (HERE / f).exists()]
@@ -189,6 +190,40 @@ def main():
             check("目标架构", WARN, "未设置 android.archs，buildozer 会打全部架构（非常慢）")
     else:
         check("buildozer.spec", FAIL, "文件不存在")
+
+    # ---------------------------------------------------------- 识别契约
+    # 决策层吃什么、模型就得给什么。这两边一旦对不上，决策会一路降级成
+    # 经验规则——界面照样出建议，你根本看不出它其实在瞎猜。
+    print("\n【3b】识别契约（模型必须读出的字段）")
+    try:
+        import recognizer as _rec
+
+        need = [
+            "street", "hole_cards", "board_cards", "hero_position",
+            "num_players", "effective_stack_bb", "pot_bb",
+            "bet_to_call_bb", "num_raisers", "num_limpers",
+        ]
+        miss = [f for f in need if f not in _rec.CARD_PROMPT]
+        if miss:
+            check("识别契约", FAIL,
+                  "CARD_PROMPT 里缺少字段：" + ", ".join(miss) +
+                  "\n决策层依赖这些字段，缺了会静默降级成经验规则。")
+        else:
+            check("识别契约", OK, f"CARD_PROMPT 含全部 {len(need)} 个字段")
+
+        probe = _rec.parse_cards(
+            '{"street":"flop","hole_cards":["As","Kh"],'
+            '"board_cards":["Td","9c","2s"],"hero_position":"BTN",'
+            '"num_players":6,"effective_stack_bb":100,"pot_bb":6.5,'
+            '"bet_to_call_bb":2,"num_raisers":1,"num_limpers":0}'
+        )
+        bad = [f for f in need if probe.get(f) is None]
+        if bad:
+            check("场景字段解析", FAIL, "parse_cards 没解析出：" + ", ".join(bad))
+        else:
+            check("场景字段解析", OK, f"{len(need)} 个字段全部解析成功")
+    except Exception as e:  # noqa: BLE001
+        check("识别契约", WARN, f"无法检查（{e}）")
 
     # ---------------------------------------------------------- 语法与导入
     print("\n【4】代码可运行性")

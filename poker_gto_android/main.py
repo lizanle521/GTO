@@ -45,6 +45,11 @@ from trainer import (
 import stats as stats_mod
 import realtime
 import recognizer
+import decision
+# 下面三个函数原先定义在本文件里，现已移到 decision.py——它们是纯逻辑，
+# 不该依赖 Kivy，而且放在那边才能脱离界面单独测试。
+# 这里重新导入一次，是为了兼容 `from main import postflop_advice` 这类旧用法。
+from decision import analyze_draws, is_overpair, postflop_advice  # noqa: F401
 
 # ---------------------------------------------------------------- 中文字体
 # Kivy 默认字体不含中文，需要注册中文字体。
@@ -98,6 +103,23 @@ COLOR_RED = (0.84, 0.27, 0.27, 1)
 COLOR_GRAY = (0.48, 0.52, 0.58, 1)
 COLOR_DARK = (0.16, 0.20, 0.25, 1)
 COLOR_AMBER = (0.78, 0.47, 0.13, 1)
+
+# 翻后胜率的蒙特卡洛模拟次数。
+# 实测：600 次在电脑上约 0.1 秒，手机上约 0.3-0.8 秒，统计误差约 ±2%——
+# 对"该跟还是该弃"这种量级的判断完全够用。调高会更准但更慢；
+# 实时识别本来就在后台线程里跑，没必要为了几十毫秒去牺牲精度。
+MC_ITERATIONS = 600
+
+
+def _action_color(action):
+    """按动作给结论文字上色：进攻绿、弃牌红、过牌灰。"""
+    if "弃牌" in action:
+        return COLOR_RED
+    if "过牌" in action:
+        return COLOR_GRAY
+    if ("下注" in action) or ("跟注" in action):
+        return COLOR_GREEN
+    return COLOR_PRIMARY
 
 
 def F(size):
@@ -271,174 +293,8 @@ class CardRow(BoxLayout):
 
 
 # ---------------------------------------------------------------- 翻后分析
-def analyze_draws(hole, board):
-    """分析听牌（仅真正的"等一张成牌"结构）。
-
-    返回听牌描述列表。注意：**超对等已成牌不属于听牌**，
-    它们由 postflop_advice 依据成牌类型单独处理。
-
-    覆盖：同花听牌、两头顺听牌、卡顺听牌。
-    """
-    from poker_core import RANK_VALUE
-
-    draws = []
-    if len(board) >= 5:
-        return draws          # 河牌已无后续，不存在听牌
-
-    all_cards = list(hole) + list(board)
-
-    # --- 同花听牌：某一花色恰好 4 张
-    suit_counts = {}
-    for c in all_cards:
-        s = c[1].lower()
-        suit_counts[s] = suit_counts.get(s, 0) + 1
-    if suit_counts and max(suit_counts.values()) == 4:
-        draws.append("同花听牌（9 张出路）")
-
-    # --- 顺子听牌：4 张参与某条顺子、只差 1 张
-    #
-    # 判定要点：区分两头顺/卡顺，要看**补牌点的个数**，不是看单张补牌
-    # 能凑出几条顺子。
-    #   · AK 在 QJ2：只有 T 能补（TJQKA）→ 1 个补牌点 → 卡顺（4 出路）
-    #   · 98 在 T72：补 J 成 789TJ、补 6 成 6789T → 2 个补牌点 → 两头顺（8 出路）
-    # 之前的实现按"单张补牌新增的顺子条数"判断，会把上面第二种情况
-    # 的两个补牌各自看成都只新增 1 条，从而误判为卡顺。
-    #
-    # 另外必须排除已成顺的情况（current_straights 非空即已成型），
-    # 否则补牌会误判成听牌。
-    rs = {RANK_VALUE[c[0]] for c in all_cards}
-    if 14 in rs:
-        rs.add(1)
-
-    def straights_with(rank_set):
-        """返回 rank_set 能构成的所有顺子的最高牌集合。"""
-        found = set()
-        for start in range(1, 11):
-            window = set(range(start, start + 5))
-            if window <= rank_set:
-                found.add(max(window))
-        return found
-
-    current_straights = straights_with(rs)
-    if not current_straights:                   # 已成型则不算听牌
-        outs = set()
-        for candidate in range(1, 15):
-            if candidate in rs:
-                continue
-            for high in (straights_with(rs | {candidate}) - current_straights):
-                window = set(range(high - 4, high + 1))
-                # 参与该顺子的牌恰好 4 张 -> 真正"差一张"的听牌结构
-                if len(window & rs) == 4:
-                    outs.add(candidate)
-                    break
-        if 14 in outs:
-            outs.discard(1)                     # A 以 1/14 重复出现，去重
-        if len(outs) >= 2:
-            draws.append("两头顺听牌（8 张出路）")
-        elif len(outs) == 1:
-            draws.append("卡顺听牌（4 张出路）")
-
-    return draws
-
-
-def is_overpair(hole, board):
-    """判断是否持有超对（口袋对子且大于公共牌最大牌）。"""
-    from poker_core import RANK_VALUE
-    if len(hole) != 2:
-        return False
-    r1, r2 = hole
-    if r1[0].upper() != r2[0].upper():
-        return False                            # 不是对子
-    if not board:
-        return False
-    hole_rank = RANK_VALUE[r1[0].upper()]
-    board_max = max(RANK_VALUE[c[0].upper()] for c in board)
-    return hole_rank > board_max
-
-
-def postflop_advice(category, draws, board, hole=None):
-    """根据成牌类型、听牌与超对情况给出下注建议。
-
-    category 必须是 poker_core 的整数类别号（CAT_*，0-8），
-    不是 describe_score 返回的中文名。传错会导致比较运算抛 TypeError，
-    因此这里先做显式校验。
-    """
-    from poker_core import (
-        CAT_HIGH_CARD, CAT_PAIR, CAT_TWO_PAIR, CAT_TRIPS, CAT_STRAIGHT,
-        CAT_FLUSH, CAT_FULL_HOUSE, CAT_QUADS, CAT_STRAIGHT_FLUSH, RANK_VALUE,
-    )
-
-    if isinstance(category, str):
-        raise TypeError(
-            f"postflop_advice 需要整数类别号（CAT_*），收到字符串 {category!r}；"
-            "请改用 poker_core.categorize(score) 的返回值。"
-        )
-    if not isinstance(category, int) or not (CAT_HIGH_CARD <= category <= CAT_STRAIGHT_FLUSH):
-        raise ValueError(f"非法牌型类别号：{category!r}")
-
-    board_ranks = [RANK_VALUE[c[0]] for c in board]
-    board_high = max(board_ranks) if board_ranks else 0
-    board_size = len(board)
-
-    # ---- 已成强牌（优先判断，不受听牌干扰）
-    if category >= CAT_STRAIGHT:
-        return (
-            "持有【顺子及以上】成牌，下大注（约 3/4 池）获取价值。\n"
-            "对手的成牌与听牌都会跟注，此时做大底池能最大化期望收益。"
-        )
-
-    if category in (CAT_TWO_PAIR, CAT_TRIPS, CAT_FULL_HOUSE, CAT_QUADS):
-        return (
-            "持有【两对以上】强牌，下大注（约 3/4 池）建池。\n"
-            "此时慢玩会损失价值，对手的顶对、听牌都愿意跟注。"
-        )
-
-    # ---- 超对（属于成牌，不是听牌）
-    if hole and is_overpair(hole, board):
-        return (
-            "持有【超对】，下注（约 1/2-3/4 池）获取价值。\n"
-            "超对通常领先对手的整个范围，从更差的对子与听牌中榨取价值。"
-        )
-
-    # ---- 强听牌（半诈唬）
-    if draws:
-        has_flush_draw = any("同花听牌" in d for d in draws)
-        has_oesd = any("两头顺听牌" in d for d in draws)
-        if has_flush_draw or has_oesd:
-            return (
-                "持有【强听牌】（同花或两头顺），建议半诈唬下注（约 1/2-3/4 池）。\n"
-                "半诈唬双赢：对手弃牌直接拿下底池；被跟注你仍有约 1/3 概率反超。\n"
-                "强听牌比弱成牌更适合下注，因为它同时具备弃牌率与反超潜力。"
-            )
-        return (
-            "持有【弱听牌】（卡顺），建议小注（约 1/3 池）或过牌。\n"
-            "卡顺仅有约 4 张出路，弃牌率与反超潜力都不足，不宜投入过多筹码。"
-        )
-
-    # ---- 顶对
-    if category == CAT_PAIR and hole:
-        hole_ranks = [RANK_VALUE[c[0]] for c in hole]
-        paired = [r for r in hole_ranks if r in board_ranks]
-
-        if paired and max(paired) == board_high:
-            if board_size == 3 and board_high >= RANK_VALUE["Q"]:
-                return (
-                    "持有【顶对】，但牌面偏高，对手范围中两对以上概率上升。\n"
-                    "建议小注（约 1/3 池）：从更差的对子获取价值，"
-                    "被加注时以较低成本脱身。"
-                )
-            return "持有【顶对】，建议下注（约 1/2-3/4 池）获取价值。"
-        if paired:
-            return (
-                "持有【中对或底对】，建议过牌或小注控制底池。\n"
-                "这类牌不足以承受大注，也不适合在被跟注时做大底池。"
-            )
-
-    # ---- 弱牌
-    return (
-        "牌力较弱，建议过牌控制底池。\n"
-        "用弱牌下注若被跟注或加注会陷入被动；过牌可保留免费看下一张的机会。"
-    )
+# analyze_draws / is_overpair / postflop_advice 已移到 decision.py，
+# 并在文件顶部重新导入。这样翻后逻辑既不依赖 Kivy，也能被独立测试。
 
 
 # ---------------------------------------------------------------- 实时识别页
@@ -763,12 +619,53 @@ class RealtimeScreen(Screen):
         note = f"识别置信度：{conf_label}"
         if uncertain:
             note += "（有无法确定的牌，请手动校对）"
+        # 场景信息要一并显示：用户得能核对"建议的依据对不对"，
+        # 只给一句结论是没法判断该不该信的。
+        scene = self._scene_summary(cards)
+        if scene:
+            note += f"　|　{scene}"
         self._set_status(note)
 
-        self._make_recommendation(hole, board, cards.get("hero_position", ""))
+        self._make_recommendation(cards)
 
-    def _make_recommendation(self, hole, board, hero_pos):
-        """根据牌面生成 GTO 推荐。"""
+    @staticmethod
+    def _scene_summary(cards):
+        """把识别到的场景信息拼成一行摘要，供状态栏显示。"""
+        street_name = {"preflop": "翻前", "flop": "翻牌", "turn": "转牌",
+                       "river": "河牌"}.get(cards.get("street"), "")
+        parts = [street_name] if street_name else []
+
+        pos = cards.get("hero_position")
+        if pos and pos != "UNKNOWN":
+            parts.append(f"位置 {pos}")
+
+        players = cards.get("num_players")
+        if players:
+            parts.append(f"{players} 人")
+
+        stack = cards.get("effective_stack_bb")
+        if stack:
+            parts.append(f"筹码 {stack:g}bb")
+
+        pot = cards.get("pot_bb")
+        if pot:
+            parts.append(f"底池 {pot:g}bb")
+
+        bet = cards.get("bet_to_call_bb")
+        if bet:
+            parts.append(f"需跟注 {bet:g}bb")
+
+        return "、".join(parts)
+
+    def _make_recommendation(self, cards):
+        """根据识别结果生成推荐。
+
+        决策全部在本地完成（范围表 + 蒙特卡洛胜率 + 底池赔率），
+        不调用大模型——大模型只负责"看牌"，"思考"由本地算。
+        这样既快（毫秒级）又可复现（同一手牌永远得到同一个结论）。
+        """
+        hole = [c for c in cards.get("hole_cards", []) if c != "??"]
+
         if len(hole) != 2:
             self.lbl_rec.text = "手牌不完整，无法给出推荐"
             self.lbl_rec.color = COLOR_GRAY
@@ -776,61 +673,25 @@ class RealtimeScreen(Screen):
             return
 
         try:
-            position = hero_pos if hero_pos in ranges.POSITIONS else "BTN"
-            if not board:
-                # 翻前
-                action, freq, desc = ranges.get_open_action(hole, position)
-                notation = __import__("poker_core").hand_notation(*hole)
-                if action == ACTION_OPEN:
-                    self.lbl_rec.text = f"翻前：开池加注（{notation}）"
-                    self.lbl_rec.color = COLOR_GREEN
-                    self.lbl_detail.text = (
-                        f"{ranges.POSITION_NAMES[position]} 用 {notation} 标准打法是加注入池。\n"
-                        f"频率：{desc}\n\n"
-                        f"该位置标准范围宽度约 {ranges.range_width(position):.1%}。"
-                    )
-                else:
-                    self.lbl_rec.text = f"翻前：弃牌（{notation}）"
-                    self.lbl_rec.color = COLOR_RED
-                    self.lbl_detail.text = (
-                        f"{notation} 不在 {ranges.POSITION_NAMES[position]} 的开池范围内。\n"
-                        f"前面位置弃牌、等待更好机会更有利可图。"
-                    )
-            else:
-                # 翻后
-                from poker_core import evaluate_best, describe_score, categorize
-                score, best = evaluate_best(hole + board)
-                cat_name, detail = describe_score(score)
-                cat_num = categorize(score)     # postflop_advice 需要整数类别号
-                street = {3: "翻牌", 4: "转牌", 5: "河牌"}.get(len(board), "翻后")
-
-                # 听牌分析：翻后决策中听牌权重极高，必须单独评估
-                draws = analyze_draws(hole, board)
-
-                self.lbl_rec.text = f"{street}：最佳牌型【{cat_name}】"
-                self.lbl_rec.color = COLOR_PRIMARY
-
-                draw_text = ""
-                if draws:
-                    draw_text = "听牌：" + "、".join(draws) + "\n"
-
-                # 根据成牌强度与听牌给出建议
-                advice = postflop_advice(cat_num, draws, board, hole)
-
-                self.lbl_detail.text = (
-                    f"最佳五张：{hand_to_string(best)}\n"
-                    f"牌型：{cat_name}（{detail}）\n"
-                    f"{draw_text}\n"
-                    f"建议：{advice}\n\n"
-                    f"翻后决策要点：\n"
-                    f"· 强牌（两对以上）→ 下大注获取价值\n"
-                    f"· 听牌 → 可考虑半诈唬，兼顾弃牌率与反超\n"
-                    f"· 弱牌 → 过牌控制底池，避免被加注"
-                )
-        except Exception as e:
+            d = decision.decide_from_cards(cards, iterations=MC_ITERATIONS)
+        except Exception as e:  # noqa: BLE001
             self.lbl_rec.text = "无法生成推荐"
             self.lbl_rec.color = COLOR_RED
             self.lbl_detail.text = str(e)
+            return
+
+        self.lbl_rec.text = d.headline
+        self.lbl_rec.color = _action_color(d.action)
+
+        lines = list(d.detail)
+        if d.warnings:
+            lines.append("")
+            lines.append("需要你确认的信息：")
+            lines.extend(f"· {w}" for w in d.warnings)
+        if d.source:
+            lines.append("")
+            lines.append(f"依据：{d.source}")
+        self.lbl_detail.text = "\n".join(lines)
 
     # ---------------------------------------- 实时识别
     def toggle_auto(self, *args):
@@ -915,6 +776,27 @@ class RealtimeScreen(Screen):
         )
         content.add_widget(board_input)
 
+        # 场景信息：识别不出来时用户可以在这里补。
+        # 这两项会直接影响建议——筹码深度决定范围宽窄（短码要收紧），
+        # 底池决定翻后的赔率与下注尺度。缺了它们，建议只能给个方向。
+        stack_input = TextInput(
+            text="",
+            hint_text="有效筹码深度，单位 bb（可留空，默认 100）",
+            font_name=FONT_NAME if _FONT_OK else "Roboto",
+            font_size=sp(15), multiline=False, input_filter="float",
+            size_hint_y=None, height=dp(44),
+        )
+        content.add_widget(stack_input)
+
+        pot_input = TextInput(
+            text="",
+            hint_text="当前底池大小，单位 bb（可留空）",
+            font_name=FONT_NAME if _FONT_OK else "Roboto",
+            font_size=sp(15), multiline=False, input_filter="float",
+            size_hint_y=None, height=dp(44),
+        )
+        content.add_widget(pot_input)
+
         pos_spinner = Spinner(
             text="BTN",
             values=("UTG", "HJ", "CO", "BTN", "SB", "BB"),
@@ -947,8 +829,16 @@ class RealtimeScreen(Screen):
             title="手动输入牌面",
             title_font=FONT_NAME if _FONT_OK else "Roboto",
             content=content,
-            size_hint=(0.9, 0.62),
+            size_hint=(0.9, 0.82),
         )
+
+        def _num_or_none(text):
+            """把输入框里的文字转成数字；空或非法都返回 None（走降级路径）。"""
+            try:
+                value = float(text.strip())
+            except (ValueError, AttributeError):
+                return None
+            return value if value > 0 else None
 
         def on_ok(*a):
             hole = hole_input.text.split()
@@ -972,6 +862,8 @@ class RealtimeScreen(Screen):
             self._apply_cards({
                 "hole_cards": hole, "board_cards": board,
                 "hero_position": pos_spinner.text,
+                "effective_stack_bb": _num_or_none(stack_input.text),
+                "pot_bb": _num_or_none(pot_input.text),
                 "confidence": "high",
             })
 

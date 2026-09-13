@@ -23,7 +23,7 @@ source.include_exts = py,png,jpg,jpeg,kv,atlas,ttf,otf,json,txt
 
 # 只打包运行必需的文件，测试与文档不进包
 source.exclude_dirs = tests,bin,.buildozer,__pycache__,.git,.github,assets/raw
-source.exclude_patterns = test_*.py,*.md,*.bat,*.sh,pack_font.py,preflight.py,build.log
+source.exclude_patterns = test_*.py,*.md,*.bat,*.sh,pack_font.py,preflight.py,verify_core.py,build.log,_*.txt
 
 version = 0.1.0
 
