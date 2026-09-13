@@ -28,10 +28,20 @@ name: Build Android APK
 'on':
   push:
     branches: [ main, master ]
+    # 只在这些**真正影响产物**的地方变化时才构建。
+    # 别图省事写成 'poker_gto_android/**' —— 那样连改 README 或工作日志
+    # 都会白跑一次 15 分钟的完整构建（实测踩过一次）。
     paths:
-      - 'poker_gto_android/**'
+      - 'poker_gto_android/*.py'
+      - 'poker_gto_android/buildozer.spec'
+      - 'poker_gto_android/assets/**'
       - '.github/workflows/build-apk.yml'
   workflow_dispatch:        # 允许手动点按钮触发
+
+# 连续推送时取消上一次仍在跑的构建，避免排队堆积白耗配额
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
