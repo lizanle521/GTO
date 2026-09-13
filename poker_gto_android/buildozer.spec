@@ -46,8 +46,26 @@ p4a.branch = v2024.01.21
 # 不申请存储权限：配置与成绩都写在 App 私有目录，无需外部存储。
 android.permissions = CAMERA,INTERNET
 
-# 摄像头在部分设备上需要声明为可选特性，否则会被判定为"必须"
-android.features = android.hardware.camera
+# ------------------------------------------------------------
+# 注意：这里【不能】写 android.features
+# ------------------------------------------------------------
+# 曾经写过 `android.features = android.hardware.camera`，它会让云端构建在
+# 最后一步直接失败（前面编译 Python/numpy 的十几分钟全部白跑）：
+#
+#   toolchain.py: error: unrecognized arguments: --feature android.hardware.camera
+#
+# 原因是 buildozer 生成 p4a 命令时写死了 `--feature`（单数），
+# 而 python-for-android 的 apk 命令根本没有这个参数（只有 --permission）。
+# 这是 buildozer 自身的缺陷，不是我们配置写错，但也无法靠改 p4a 版本绕开。
+#
+# 删掉它不影响摄像头功能：权限由上面的 android.permissions = CAMERA 保证，
+# 而 p4a 的 sdl2 bootstrap 模板会据此在 AndroidManifest 里自动补上
+# <uses-feature android:name="android.hardware.camera" />。
+#
+# 反过来，如果哪天真的需要声明为"可选特性"（避免没有摄像头的平板被判定
+# 为不兼容），正确做法是用 android.extra_manifest_xml 插入
+#   <uses-feature android:name="android.hardware.camera" android:required="false"/>
+# 而不是用 android.features。
 
 android.api = 33
 android.minapi = 24
@@ -77,8 +95,17 @@ android.accept_sdk_license = True
 android.allow_backup = True
 android.wakelock = True
 
-# 摄像头 / 屏幕方向
-android.orientation = portrait
+# ------------------------------------------------------------
+# 屏幕方向
+# ------------------------------------------------------------
+# 注意前缀：是 `orientation`，【不是】 `android.orientation`。
+# buildozer 读的是前者：
+#     orientation = config.getlist('app', 'orientation', ['landscape'])
+# 所以写成 android.orientation 会被静默忽略，构建日志里出现的是默认值
+# landscape —— 而且不会报任何错，只是 App 方向不对，很难查。
+# 判断有没有生效，看构建日志里这一行：
+#     # Run '... -m pythonforandroid.toolchain apk ... --orientation portrait ...'
+orientation = portrait
 
 # 中文字体已在 assets/chinese.ttf，会被 source.include_exts 带走
 # 图标与启动图（可选，放了就用）

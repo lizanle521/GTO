@@ -137,6 +137,47 @@ def main():
                   "解决：在 buildozer.spec 的 [app] 段加一行\n"
                   "  android.accept_sdk_license = True")
 
+        # ---- android.features：会让构建在最后一步失败 ----
+        # 实测（p4a v2024.01.21 + 当前 buildozer）：
+        #   toolchain.py: error: unrecognized arguments: --feature android.hardware.camera
+        # buildozer 生成 p4a 命令时写死 `--feature`（单数），而 p4a 的 apk
+        # 命令没有这个参数（只有 --permission）。最坑的是它发生在最后一步：
+        # 前面编译 Python / numpy 的十几分钟全部白跑，然后才报错。
+        feats = [l.strip() for l in text.splitlines()
+                 if l.strip().startswith("android.features")]
+        if feats:
+            check("android.features", FAIL,
+                  "spec 里写了 android.features，构建会在最后一步失败：\n"
+                  "  toolchain.py: error: unrecognized arguments: --feature ...\n"
+                  "原因是 buildozer 传给 p4a 的是 `--feature`，而 p4a 不接受该参数。\n"
+                  "解决：删掉这一行。摄像头权限由 android.permissions = CAMERA 保证，\n"
+                  "p4a 的 sdl2 模板会据此自动在 AndroidManifest 里补上 uses-feature。")
+        else:
+            check("android.features", OK,
+                  "未使用（该选项会导致 p4a 报 unrecognized arguments）")
+
+        # ---- 屏幕方向：key 名是 orientation，不是 android.orientation ----
+        # buildozer 源码：config.getlist('app', 'orientation', ['landscape'])
+        # 写成 android.orientation 会被静默忽略——不报错，但方向是默认的
+        # landscape，只能靠翻构建日志里的 --orientation 参数才发现。
+        orient = ""
+        wrong_orient = False
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("android.orientation"):
+                wrong_orient = True
+            elif s.startswith("orientation"):
+                orient = s.split("=", 1)[1].strip() if "=" in s else ""
+        if wrong_orient:
+            check("屏幕方向", FAIL,
+                  "写的是 android.orientation —— buildozer 不读这个 key，\n"
+                  "会被静默忽略（构建日志里仍是默认的 landscape），且不报任何错。\n"
+                  "解决：改成 orientation = portrait")
+        elif orient:
+            check("屏幕方向", OK, f"orientation = {orient}")
+        else:
+            check("屏幕方向", WARN, "未设置 orientation，buildozer 会用默认的 landscape")
+
         # ---- NDK / API 与 p4a 版本是否匹配 ----
         ndk_v = api_v = p4a_v = archs_v = ""
         for line in text.splitlines():
